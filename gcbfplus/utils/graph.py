@@ -8,6 +8,8 @@ from jax._src.tree_util import GetAttrKey
 from ..utils.typing import Any, Array, Bool, Float, Int
 from .utils import merge01
 
+import ipdb
+
 _State = TypeVar("_State")
 _EnvState = TypeVar("_EnvState")
 

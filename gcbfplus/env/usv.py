@@ -15,6 +15,7 @@ from .obstacle import Obstacle, Rectangle
 from .plot import render_video
 from .utils import get_lidar, inside_obstacles, get_node_goal_rng
 
+import ipdb
 
 class USV(MultiAgentEnv):
     AGENT = 0
@@ -55,7 +56,7 @@ class USV(MultiAgentEnv):
 
     @property
     def state_dim(self) -> int:
-        return 4  # x, y, theta, v
+        return 6  # 从4改为6: [x, y, φ, u, v, r]
 
     @property
     def node_dim(self) -> int:
@@ -63,7 +64,7 @@ class USV(MultiAgentEnv):
 
     @property
     def edge_dim(self) -> int:
-        return 4  # x_rel, y_rel, vx_rel, vy_rel
+        return 5  # 从4改为5: [dx_body, dy_body, du, dv, dr]
 
     @property
     def action_dim(self) -> int:
@@ -87,18 +88,40 @@ class USV(MultiAgentEnv):
         obstacles = self.create_obstacles(obs_pos, obs_len[:, 0], obs_len[:, 1], obs_theta)
 
         # randomly generate agent and goal
-        states, goals = get_node_goal_rng(
-            key, self.area_size, 2, obstacles, self.num_agents, 4 * self.params["car_radius"], self.max_travel)
+        pos_key, key = jr.split(key)
+        states_pos, goals_pos = get_node_goal_rng(
+            pos_key, self.area_size, 2, obstacles, self.num_agents,
+            4 * self.params["car_radius"], self.max_travel
+        )
+        
+         # 初始化完整状态向量 [x, y, φ, u, v, r]
+        states = jnp.zeros((self.num_agents, 6))
+        goals = jnp.zeros((self.num_agents, 6))  
+        
+        # 添加位置信息 
+        states = states.at[:, :2].set(states_pos)
+        goals = goals.at[:, :2].set(goals_pos)
 
-        # add random heading
-        theta_key, key = jr.split(key, 2)
-        states = jnp.concatenate([states, jnp.zeros((self.num_agents, 2))], axis=1)
-        goals = jnp.concatenate([goals, jnp.zeros((self.num_agents, 2))], axis=1)
-        states = states.at[:, 2].set(jr.uniform(theta_key, (self.num_agents,), minval=-np.pi, maxval=np.pi))
-        goals = goals.at[:, 2].set(jnp.arctan2(goals[:, 1] - states[:, 1], goals[:, 0] - states[:, 0]))
+        # 随机初始航向
+        phi_key, key = jr.split(key)
+        initial_phi = jr.uniform(phi_key, (self.num_agents,), 
+                                minval=-jnp.pi, maxval=jnp.pi)
+        states = states.at[:, 2].set(initial_phi)
+
+        # 设置目标航向（朝向目标点）
+        target_phi = jnp.arctan2(goals_pos[:,1]-states_pos[:,1], 
+                            goals_pos[:,0]-states_pos[:,0])
+        goals = goals.at[:, 2].set(target_phi)
+
+        # 初始化速度（可添加随机小扰动）
+        vel_key, key = jr.split(key)
+        initial_u = jr.normal(vel_key, (self.num_agents,)) * 0.1
+        states = states.at[:, 3].set(initial_u)  # u
 
         env_states = self.EnvState(states, goals, obstacles)
 
+        assert env_states.agent.shape == (self.num_agents, 6)
+        assert env_states.goal.shape == (self.num_agents, 6)
         return self.get_graph(env_states)
 
     def agent_step_euler(self, agent_states: AgentState, action: Action, stop_mask: Array) -> AgentState:
@@ -194,51 +217,116 @@ class USV(MultiAgentEnv):
     def edge_blocks(self, state: EnvState, lidar_data: State) -> list[EdgeBlock]:
         n_hits = self._params["n_rays"] * self.num_agents
 
-        # agent - agent connection
+        agent_states = state.agent  # [N,6]
+        assert agent_states.shape[1] == 6 
+        goal_states = state.goal    # [N,6]
         agent_pos = state.agent[:, :2]
-        pos_diff = agent_pos[:, None, :] - agent_pos[None, :, :]  # [i, j]: i -> j
-        dist = jnp.linalg.norm(pos_diff, axis=-1)
-        dist += jnp.eye(dist.shape[1]) * (self._params["comm_radius"] + 1)
-        pos_theta_diff = state.agent[:, None, :2] - state.agent[None, :, :2]
-        agent_v = jnp.concatenate([(state.agent[:, 3] * jnp.cos(state.agent[:, 2]))[:, None],
-                                   (state.agent[:, 3] * jnp.sin(state.agent[:, 2]))[:, None]], axis=-1)
-        v_diff = agent_v[:, None, :] - agent_v[None, :, :]
-        state_diff = jnp.concatenate([pos_theta_diff, v_diff], axis=-1)
-        agent_agent_mask = jnp.less(dist, self._params["comm_radius"])
+
+        # ===== 辅助函数 =====
+        def get_body_relative(pos_diff, phi):
+            """将全局位置差转换到本体坐标系"""
+            R_inv = jnp.array([[jnp.cos(phi), jnp.sin(phi)],
+                            [-jnp.sin(phi), jnp.cos(phi)]])
+            return jnp.dot(R_inv, pos_diff)
+
+        # ===== Agent-Agent 连接 =====
+        # 本体坐标系相对位置
+        global_pos_diff = agent_states[:, None, :2] - agent_states[None, :, :2]  # [i,j,2]
+        body_pos_diff = global_pos_diff
+        # def process_row(g_row, phi_i):
+        #     return jax.vmap(lambda pos_diff: get_body_relative(pos_diff, phi_i))(g_row)
+
+        # body_pos_diff = jax.vmap(process_row, in_axes=(0, 0))(
+        #     global_pos_diff,  # shape (num_agents, num_agents, 2)
+        #     agent_states[:, 2]  # shape (num_agents,)
+        # )
+
+        # 本体速度差
+        u = agent_states[:, 3]  # [N]
+        v = agent_states[:, 4]
+        r = agent_states[:, 5]
+        du = u[:, None] - u[None, :]  # [i,j]
+        dv = v[:, None] - v[None, :]
+        dr = r[:, None] - r[None, :]
+
+        # 构建边特征 [dx_body, dy_body, du, dv, dr]
+        agent_agent_feats = jnp.concatenate([
+            body_pos_diff,          # [i,j,2]
+            du[..., None],          # [i,j,1]
+            dv[..., None],          # [i,j,1]
+            dr[..., None]           # [i,j,1]
+        ], axis=-1)  # [i,j,5]
+
+        # 通信掩码
+        dist = jnp.linalg.norm(global_pos_diff, axis=-1)
+        mask = jnp.less(dist, self._params["comm_radius"])
+        mask = mask & (1 - jnp.eye(self.num_agents, dtype=bool))  # 排除自连接
+        
         id_agent = jnp.arange(self.num_agents)
-        agent_agent_edges = EdgeBlock(state_diff, agent_agent_mask, id_agent, id_agent)
+        agent_agent = EdgeBlock(agent_agent_feats, mask, id_agent, id_agent)
 
-        # agent - goal connection
-        agent_goal_edges = []
-        agent_goal_pos_diff = state.agent[:, :2] - state.goal[:, :2]
-        agent_goal_v_diff = agent_v
-        agent_goal_edge_feats = jnp.concatenate([agent_goal_pos_diff, agent_goal_v_diff], axis=-1)
-        feats_norm = jnp.sqrt(1e-6 + jnp.sum(agent_goal_edge_feats[:, :2] ** 2, axis=-1, keepdims=True))
-        comm_radius = self._params["comm_radius"]
-        safe_feats_norm = jnp.maximum(feats_norm, comm_radius)
-        coef = jnp.where(feats_norm > comm_radius, comm_radius / safe_feats_norm, 1.0)
-        agent_goal_edge_feats = agent_goal_edge_feats.at[:, :2].set(agent_goal_edge_feats[:, :2] * coef)
-        id_goal = jnp.arange(self.num_agents, self.num_agents * 2)
+        # ===== Agent-Goal 连接 =====
+        agent_goal_feats = []
         for i in range(self.num_agents):
-            agent_goal_edges.append(
-                EdgeBlock(agent_goal_edge_feats[i][None, None, :], jnp.ones((1, 1)), id_agent[i][None], id_goal[i][None]))
+            # 本体坐标系位置差
+            global_diff = agent_states[i, :2] - goal_states[i, :2]
+            body_diff = get_body_relative(global_diff, agent_states[i, 2])
+            
+            # 速度特征
+            u_rel = u[i]  # 本体速度直接使用
+            v_rel = v[i]
+            
+            # 构建特征 [dx_body, dy_body, u, v, r]
+            feat = jnp.concatenate([
+                body_diff, 
+                jnp.array([u_rel, v_rel, r[i]])
+            ])
+            agent_goal_feats.append(feat[None, None, :])  # [1,1,5]
 
-        # agent - obs connection
-        id_obs = jnp.arange(self.num_agents * 2, self.num_agents * 2 + n_hits)
+        id_goal = jnp.arange(self.num_agents, 2*self.num_agents)
+        agent_goal = [
+            EdgeBlock(feat, jnp.ones((1,1)), id_agent[i][None], id_goal[i][None])
+            for i, feat in enumerate(agent_goal_feats)
+        ]
+        assert len(agent_goal) == self.num_agents
+        # assert agent_goal[0].feats.shape == (1, 1, 5)
+
+        # ===== Agent-Obstacle 连接 =====
+        # Agent-Obstacle连接
         agent_obs_edges = []
+        id_obs = jnp.arange(2*self.num_agents, 2*self.num_agents + n_hits)
         for i in range(self.num_agents):
+            # 激光数据转换到本体坐标系
             id_hits = jnp.arange(i * self._params["n_rays"], (i + 1) * self._params["n_rays"])
+            pos_diff = agent_states[i, :2] - lidar_data[id_hits, :2]
+            
+            current_agent = state.agent[i]
+            u = current_agent[3]  
+            v = current_agent[4]  
+            r = current_agent[5]  
+            speed_feat = jnp.array([u, v, r])[None, :]  # shape (1,3)
+            speed_feat = jnp.tile(speed_feat, (self._params["n_rays"], 1))  # shape (n_rays,3)
+            assert speed_feat.shape == (self._params["n_rays"], 3)
+            # 构建特征 [dx_body, dy_body, u, v, r]
+            lidar_feats = jnp.concatenate([
+                pos_diff,  # [n_rays,2]
+                speed_feat      # [n_rays,3]
+            ], axis=1)  # -> [n_rays,5]
+            assert lidar_feats.shape == (self._params["n_rays"], 5)
+            # 激活掩码
             lidar_pos = agent_pos[i, :] - lidar_data[id_hits, :2]
-            lidar_feats = jnp.concatenate([state.agent[i, :2], agent_v[i]]) - lidar_data[id_hits, :]
             lidar_dist = jnp.linalg.norm(lidar_pos, axis=-1)
             active_lidar = jnp.less(lidar_dist, self._params["comm_radius"] - 1e-1)
+            
             agent_obs_mask = jnp.ones((1, self._params["n_rays"]))
             agent_obs_mask = jnp.logical_and(agent_obs_mask, active_lidar)
             agent_obs_edges.append(
                 EdgeBlock(lidar_feats[None, :, :], agent_obs_mask, id_agent[i][None], id_obs[id_hits])
             )
+        
+        assert len(agent_obs_edges) == self.num_agents
+        return [agent_agent] + agent_goal + agent_obs_edges
 
-        return [agent_agent_edges] + agent_goal_edges + agent_obs_edges
 
     def control_affine_dyn(self, state: State) -> [Array, Array]:
         assert state.ndim == 2
@@ -255,31 +343,58 @@ class USV(MultiAgentEnv):
 
     def add_edge_feats(self, graph: GraphsTuple, state: State) -> GraphsTuple:
         assert graph.is_single
-        assert state.ndim == 2
+        assert state.ndim == 2  # state shape: [num_nodes, 6]
 
-        v = jnp.concatenate([(state[:, 3] * jnp.cos(state[:, 2]))[:, None],
-                             (state[:, 3] * jnp.sin(state[:, 2]))[:, None]], axis=-1)
-        edge_state = jnp.concatenate([state[:, :2], v], axis=-1)
-        assert edge_state.shape[1] == self.edge_dim
-        edge_feats = edge_state[graph.receivers] - edge_state[graph.senders]
-        feats_norm = jnp.sqrt(1e-6 + jnp.sum(edge_feats[:, :2] ** 2, axis=-1, keepdims=True))
+        # 获取发送端和接收端索引
+        senders = graph.senders
+        receivers = graph.receivers
+        
+        # ===== 本体坐标系转换 =====
+        def body_relative(sender_state, receiver_pos):
+            """将接收端位置转换到发送端本体坐标系"""
+            phi = sender_state[2]
+            R_inv = jnp.array([[jnp.cos(phi), jnp.sin(phi)],
+                            [-jnp.sin(phi), jnp.cos(phi)]])
+            return R_inv @ (receiver_pos - sender_state[:2])
+
+        # 计算本体相对位置
+        sender_states = state[senders]  # [num_edges, 6]
+        receiver_pos = state[receivers, :2]  # [num_edges, 2]
+        body_pos_diff = jax.vmap(body_related)(sender_states, receiver_pos)  # [num_edges, 2]
+
+        # ===== 速度差计算 =====
+        u_diff = sender_states[:, 3] - state[receivers, 3]  # du
+        v_diff = sender_states[:, 4] - state[receivers, 4]  # dv
+        r_diff = sender_states[:, 5] - state[receivers, 5]  # dr
+
+        # ===== 构建边特征 =====
+        edge_feats = jnp.concatenate([
+            body_pos_diff,          # dx_body, dy_body
+            u_diff[:, None],        # du
+            v_diff[:, None],        # dv
+            r_diff[:, None]         # dr
+        ], axis=1)  # [num_edges, 5]
+
+        # ===== 特征归一化 =====
+        pos_norm = jnp.linalg.norm(body_pos_diff, axis=1, keepdims=True)
         comm_radius = self._params["comm_radius"]
-        safe_feats_norm = jnp.maximum(feats_norm, comm_radius)
-        coef = jnp.where(feats_norm > comm_radius, comm_radius / safe_feats_norm, 1.0)
-        edge_feats = edge_feats.at[:, :2].set(edge_feats[:, :2] * coef)
+        scale = jnp.where(pos_norm > comm_radius, comm_radius/pos_norm, 1.0)
+        edge_feats = edge_feats.at[:, :2].set(edge_feats[:, :2] * scale)
+
         return graph._replace(edges=edge_feats, states=state)
 
     def get_graph(self, state: EnvState, adjacency: Array = None) -> GraphsTuple:
-        # node features
+        # 节点特征（保持不变）
         n_hits = self._params["n_rays"] * self.num_agents
         n_nodes = 2 * self.num_agents + n_hits
-        node_feats = jnp.zeros((self.num_agents * 2 + n_hits, 3))
-        node_feats = node_feats.at[: self.num_agents, 2].set(1)  # agent feats
-        node_feats = node_feats.at[self.num_agents: self.num_agents * 2, 1].set(1)  # goal feats
-        node_feats = node_feats.at[-n_hits:, 0].set(1)  # obs feats
+        node_feats = jnp.zeros((n_nodes, 3))
+        node_feats = node_feats.at[:self.num_agents, 2].set(1)    # Agent节点: [0,0,1]
+        node_feats = node_feats.at[self.num_agents:self.num_agents*2, 1].set(1)  # Goal节点: [0,1,0]
+        node_feats = node_feats.at[-n_hits:, 0].set(1)            # Obstacle节点: [1,0,0]
 
+        # 节点类型标识
         node_type = jnp.zeros(n_nodes, dtype=jnp.int32)
-        node_type = node_type.at[self.num_agents: self.num_agents * 2].set(USV.GOAL)
+        node_type = node_type.at[self.num_agents:self.num_agents*2].set(USV.GOAL)
         node_type = node_type.at[-n_hits:].set(USV.OBS)
 
         get_lidar_vmap = jax.vmap(
@@ -291,7 +406,7 @@ class USV(MultiAgentEnv):
             )
         )
         lidar_data = merge01(get_lidar_vmap(state.agent[:, :2]))
-        lidar_data = jnp.concatenate([lidar_data, jnp.zeros((lidar_data.shape[0], 2))], axis=-1)
+        lidar_data = jnp.concatenate([lidar_data, jnp.zeros((lidar_data.shape[0], 4))], axis=-1)
         edge_blocks = self.edge_blocks(state, lidar_data)
 
         # create graph
@@ -302,7 +417,7 @@ class USV(MultiAgentEnv):
             env_states=state,
             states=jnp.concatenate([state.agent, state.goal, lidar_data], axis=0),
         ).to_padded()
-
+    
     def state_lim(self, state: Optional[State] = None) -> Tuple[State, State]:
         """
         Returns
@@ -310,8 +425,9 @@ class USV(MultiAgentEnv):
         lower_limit, upper_limit: Tuple[State, State],
             limits of the state
         """
-        lower_lim = jnp.array([-jnp.inf, -jnp.inf, -jnp.inf, -0.8])
-        upper_lim = jnp.array([jnp.inf, jnp.inf, jnp.inf, 0.8])
+
+        lower_lim = jnp.array([-jnp.inf, -jnp.inf, -jnp.pi, -5, -2, -3])
+        upper_lim = jnp.array([jnp.inf, jnp.inf, jnp.pi, -5, -2, -3])
         return lower_lim, upper_lim
 
     def action_lim(self) -> Tuple[Action, Action]:
@@ -393,6 +509,7 @@ class USV(MultiAgentEnv):
         next_states = jnp.concatenate([next_agent_states, goal_states, obs_states], axis=0)
 
         next_graph = self.add_edge_feats(graph, next_states)
+        ipdb.set_trace()
         return next_graph
 
     def safe_mask(self, graph: GraphsTuple) -> Array:

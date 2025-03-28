@@ -15,6 +15,7 @@ from .obstacle import Obstacle, Rectangle
 from .plot import render_video
 from .utils import get_lidar, inside_obstacles, get_node_goal_rng
 
+import ipdb
 
 class DubinsCar(MultiAgentEnv):
     AGENT = 0
@@ -234,6 +235,7 @@ class DubinsCar(MultiAgentEnv):
             active_lidar = jnp.less(lidar_dist, self._params["comm_radius"] - 1e-1)
             agent_obs_mask = jnp.ones((1, self._params["n_rays"]))
             agent_obs_mask = jnp.logical_and(agent_obs_mask, active_lidar)
+            ipdb.set_trace()        
             agent_obs_edges.append(
                 EdgeBlock(lidar_feats[None, :, :], agent_obs_mask, id_agent[i][None], id_obs[id_hits])
             )
@@ -294,6 +296,7 @@ class DubinsCar(MultiAgentEnv):
         lidar_data = jnp.concatenate([lidar_data, jnp.zeros((lidar_data.shape[0], 2))], axis=-1)
         edge_blocks = self.edge_blocks(state, lidar_data)
 
+        ipdb.set_trace()
         # create graph
         return GetGraph(
             nodes=node_feats,

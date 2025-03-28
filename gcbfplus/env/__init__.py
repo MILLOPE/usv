@@ -6,6 +6,7 @@ from .double_integrator import DoubleIntegrator
 from .linear_drone import LinearDrone
 from .dubins_car import DubinsCar
 from .crazyflie import CrazyFlie
+from .usv import USV
 
 
 ENV = {
@@ -14,7 +15,7 @@ ENV = {
     'LinearDrone': LinearDrone,
     'DubinsCar': DubinsCar,
     'CrazyFlie': CrazyFlie,
-    'usv': USV, 
+    'USV': USV, 
 }
 
 
