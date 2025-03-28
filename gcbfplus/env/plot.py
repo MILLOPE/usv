@@ -267,7 +267,7 @@ def render_video(
     text_font_opts = dict(
         size=16,
         color="k",
-        family="cursive",
+        family="DejaVu Serif",
         weight="normal",
         transform=ax.transAxes,
     )
@@ -294,7 +294,7 @@ def render_video(
     label_font_opts = dict(
         size=20,
         color="k",
-        family="cursive",
+        family="DejaVu Serif",
         weight="normal",
         ha="center",
         va="center",

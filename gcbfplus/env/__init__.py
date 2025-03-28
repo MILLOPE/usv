@@ -14,6 +14,7 @@ ENV = {
     'LinearDrone': LinearDrone,
     'DubinsCar': DubinsCar,
     'CrazyFlie': CrazyFlie,
+    'usv': USV, 
 }
 
 
