@@ -39,6 +39,8 @@ class USV(MultiAgentEnv):
         "n_rays": 16,
         "obs_len_range": [0.1, 0.6],
         "n_obs": 8,
+        'mu': 25.8,
+        'mr': 2.76,
     }
 
     def __init__(
@@ -56,7 +58,7 @@ class USV(MultiAgentEnv):
 
     @property
     def state_dim(self) -> int:
-        return 6  # 从4改为6: [x, y, φ, u, v, r]
+        return 6  #[x, y, φ, u, v, r]
 
     @property
     def node_dim(self) -> int:
@@ -64,7 +66,7 @@ class USV(MultiAgentEnv):
 
     @property
     def edge_dim(self) -> int:
-        return 5  # 从4改为5: [dx_body, dy_body, du, dv, dr]
+        return 5  # [dx_body, dy_body, du, dv, dr]
 
     @property
     def action_dim(self) -> int:
@@ -113,7 +115,7 @@ class USV(MultiAgentEnv):
                             goals_pos[:,0]-states_pos[:,0])
         goals = goals.at[:, 2].set(target_phi)
 
-        # 初始化速度（可添加随机小扰动）
+        # initial u 
         vel_key, key = jr.split(key)
         initial_u = jr.normal(vel_key, (self.num_agents,)) * 0.1
         states = states.at[:, 3].set(initial_u)  # u
@@ -127,22 +129,74 @@ class USV(MultiAgentEnv):
     def agent_step_euler(self, agent_states: AgentState, action: Action, stop_mask: Array) -> AgentState:
         assert action.shape == (self.num_agents, self.action_dim)
         assert agent_states.shape == (self.num_agents, self.state_dim)
-        x_dot = self.agent_xdot(agent_states, action) * (1 - stop_mask)[:, None]
+        
+        # 应用停止掩码
+        active_mask = (1 - stop_mask)[:, None]
+        
+        # 计算状态导数
+        x_dot = self.agent_xdot(agent_states, action) * active_mask
+        
+        # 欧拉积分
         n_state_agent_new = agent_states + x_dot * self.dt
+        
         assert n_state_agent_new.shape == (self.num_agents, self.state_dim)
+        # 状态裁剪
         return self.clip_state(n_state_agent_new)
 
     def agent_xdot(self, agent_states: AgentState, action: Action) -> AgentState:
-        assert action.shape == (self.num_agents, self.action_dim)
-        assert agent_states.shape == (self.num_agents, self.state_dim)
-        x_dot = jnp.concatenate([
-            (jnp.cos(agent_states[:, 2]) * agent_states[:, 3])[:, None],
-            (jnp.sin(agent_states[:, 2]) * agent_states[:, 3])[:, None],
-            (action[:, 0] * 20.)[:, None],
-            (action[:, 1])[:, None]
+        # 系统参数
+        m_u = self.params['mu']  # 前向有效质量
+        m_r = self.params['mr']  # 转动惯量
+
+        # 分解状态变量
+        phi = agent_states[:, 2]  # 航向角
+        u = agent_states[:, 3]    # 前向速度（本体）
+        v = agent_states[:, 4]    # 侧向速度（本体）
+        r = agent_states[:, 5]    # 偏航角速度
+
+        # 控制输入
+        tau_u = action[:, 0]  # 前向推力
+        tau_r = action[:, 1]  # 偏航力矩
+
+        # ===== 运动学方程 =====
+        # 全局坐标系速度
+        x_dot = u * jnp.cos(phi) - v * jnp.sin(phi)
+        y_dot = u * jnp.sin(phi) + v * jnp.cos(phi)
+        phi_dot = r
+
+        # ===== 水动力项计算 =====
+        def F_u(v, r, u):
+            return (1 / 25.8) * (33.8 * v * r + 1.1 * r**2 - 0.72 * u - 5.87 * u**3)
+
+        def F_v(u, v, r):
+            return (1 / 33.8) * (-25.8 * u * r - 0.86 * v - 36.3 * jnp.abs(v) * v + 36.5 * jnp.abs(v) * r)
+
+        def F_r(u, v, r):
+            return (1 / 2.76) * (-33.8 * u * v - 1.1 * u * r + 25.8 * u * v - 1.9 * r)
+
+        # 计算水动力项
+        f_u = F_u(v, r, u)
+        f_v = F_v(u, v, r)
+        f_r = F_r(u, v, r)
+
+        # ===== 动力学方程 =====
+        # 本体坐标系加速度
+        u_dot = f_u + tau_u / m_u
+        v_dot = f_v
+        r_dot = f_r + tau_r / m_r
+
+        # ===== 组合状态导数 =====
+        x_dot_full = jnp.concatenate([
+            x_dot[:, None],  # dx/dt
+            y_dot[:, None],  # dy/dt
+            phi_dot[:, None],  # dφ/dt
+            u_dot[:, None],  # du/dt
+            v_dot[:, None],  # dv/dt
+            r_dot[:, None]   # dr/dt
         ], axis=1)
-        assert x_dot.shape == (self.num_agents, self.state_dim)
-        return x_dot
+
+        assert x_dot_full.shape == agent_states.shape
+        return x_dot_full
 
     def step(
             self, graph: EnvGraphsTuple, action: Action, get_eval_info: bool = False
