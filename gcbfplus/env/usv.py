@@ -34,7 +34,7 @@ class USV(MultiAgentEnv):
     EnvGraphsTuple = GraphsTuple[State, EnvState]
 
     PARAMS = {
-        "car_radius": 0.05,
+        "car_radius": 0.1,
         "comm_radius": 0.5,
         "n_rays": 16,
         "obs_len_range": [0.1, 0.6],
@@ -116,9 +116,9 @@ class USV(MultiAgentEnv):
         goals = goals.at[:, 2].set(target_phi)
 
         # initial u 
-        vel_key, key = jr.split(key)
-        initial_u = jr.normal(vel_key, (self.num_agents,)) * 0.1
-        states = states.at[:, 3].set(initial_u)  # u
+        # vel_key, key = jr.split(key)
+        # initial_u = jr.normal(vel_key, (self.num_agents,)) * 0.1
+        # states = states.at[:, 3].set(initial_u)  # u
 
         env_states = self.EnvState(states, goals, obstacles)
 
@@ -165,7 +165,7 @@ class USV(MultiAgentEnv):
         phi_dot = r
 
         # ===== 水动力项计算 =====
-        def F_u(v, r, u):
+        def F_u(u, v, r):
             return (1 / 25.8) * (33.8 * v * r + 1.1 * r**2 - 0.72 * u - 5.87 * u**3)
 
         def F_v(u, v, r):
@@ -175,7 +175,7 @@ class USV(MultiAgentEnv):
             return (1 / 2.76) * (-33.8 * u * v - 1.1 * u * r + 25.8 * u * v - 1.9 * r)
 
         # 计算水动力项
-        f_u = F_u(v, r, u)
+        f_u = F_u(u, v, r)
         f_v = F_v(u, v, r)
         f_r = F_r(u, v, r)
 
@@ -324,7 +324,7 @@ class USV(MultiAgentEnv):
         for i in range(self.num_agents):
             # 本体坐标系位置差
             global_diff = agent_states[i, :2] - goal_states[i, :2]
-            body_diff = get_body_relative(global_diff, agent_states[i, 2])
+            # body_diff = get_body_relative(global_diff, agent_states[i, 2])
             
             # 速度特征
             u_rel = u[i]  # 本体速度直接使用
@@ -332,7 +332,7 @@ class USV(MultiAgentEnv):
             
             # 构建特征 [dx_body, dy_body, u, v, r]
             feat = jnp.concatenate([
-                body_diff, 
+                global_diff, 
                 jnp.array([u_rel, v_rel, r[i]])
             ])
             agent_goal_feats.append(feat[None, None, :])  # [1,1,5]
@@ -397,44 +397,32 @@ class USV(MultiAgentEnv):
 
     def add_edge_feats(self, graph: GraphsTuple, state: State) -> GraphsTuple:
         assert graph.is_single
-        assert state.ndim == 2  # state shape: [num_nodes, 6]
+        assert state.ndim == 2  # state shape: [num_nodes, 5]
 
         # 获取发送端和接收端索引
         senders = graph.senders
         receivers = graph.receivers
-        
-        # ===== 本体坐标系转换 =====
-        def body_relative(sender_state, receiver_pos):
-            """将接收端位置转换到发送端本体坐标系"""
-            phi = sender_state[2]
-            R_inv = jnp.array([[jnp.cos(phi), jnp.sin(phi)],
-                            [-jnp.sin(phi), jnp.cos(phi)]])
-            return R_inv @ (receiver_pos - sender_state[:2])
-
         # 计算本体相对位置
-        sender_states = state[senders]  # [num_edges, 6]
-        receiver_pos = state[receivers, :2]  # [num_edges, 2]
-        body_pos_diff = jax.vmap(body_related)(sender_states, receiver_pos)  # [num_edges, 2]
+        positions = state[:, :2]  # [x, y]
+        velocities = state[:, 3:5]  # [u, v] (longitudinal and lateral velocities)
+        angular_velocity = state[:, 5:6]  # [r] (yaw rate)
 
-        # ===== 速度差计算 =====
-        u_diff = sender_states[:, 3] - state[receivers, 3]  # du
-        v_diff = sender_states[:, 4] - state[receivers, 4]  # dv
-        r_diff = sender_states[:, 5] - state[receivers, 5]  # dr
+        # Compute relative positions (dx, dy)
+        pos_diff = positions[graph.receivers] - positions[graph.senders]
 
-        # ===== 构建边特征 =====
-        edge_feats = jnp.concatenate([
-            body_pos_diff,          # dx_body, dy_body
-            u_diff[:, None],        # du
-            v_diff[:, None],        # dv
-            r_diff[:, None]         # dr
-        ], axis=1)  # [num_edges, 5]
+        # Compute relative velocities (u, v, r)
+        vel_diff = velocities[graph.receivers] - velocities[graph.senders]
+        ang_vel_diff = angular_velocity[graph.receivers] - angular_velocity[graph.senders]
 
-        # ===== 特征归一化 =====
-        pos_norm = jnp.linalg.norm(body_pos_diff, axis=1, keepdims=True)
+        # Concatenate all edge features: [dx, dy, u, v, r]
+        edge_feats = jnp.concatenate([pos_diff, vel_diff, ang_vel_diff], axis=-1)
+
+
+        feats_norm = jnp.sqrt(1e-6 + jnp.sum(edge_feats[:, :2] ** 2, axis=-1, keepdims=True))
         comm_radius = self._params["comm_radius"]
-        scale = jnp.where(pos_norm > comm_radius, comm_radius/pos_norm, 1.0)
-        edge_feats = edge_feats.at[:, :2].set(edge_feats[:, :2] * scale)
-
+        safe_feats_norm = jnp.maximum(feats_norm, comm_radius)
+        coef = jnp.where(feats_norm > comm_radius, comm_radius / safe_feats_norm, 1.0)
+        edge_feats = edge_feats.at[:, :2].set(edge_feats[:, :2] * coef)
         return graph._replace(edges=edge_feats, states=state)
 
     def get_graph(self, state: EnvState, adjacency: Array = None) -> GraphsTuple:
@@ -481,7 +469,7 @@ class USV(MultiAgentEnv):
         """
 
         lower_lim = jnp.array([-jnp.inf, -jnp.inf, -jnp.pi, -5, -2, -3])
-        upper_lim = jnp.array([jnp.inf, jnp.inf, jnp.pi, -5, -2, -3])
+        upper_lim = jnp.array([jnp.inf, jnp.inf, jnp.pi, 5, 2, 3])
         return lower_lim, upper_lim
 
     def action_lim(self) -> Tuple[Action, Action]:
@@ -498,54 +486,42 @@ class USV(MultiAgentEnv):
     def u_ref(self, graph: GraphsTuple) -> Action:
         agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
         goal_states = graph.type_states(type_idx=1, n_type=self.num_agents)
-        pos_diff = agent_states[:, :2] - goal_states[:, :2]
+        pos_diff = goal_states[:, :2] - agent_states[:, :2]  # Corrected to point towards the goal
 
         # PID parameters
-        k_omega = 1.0  # 0.5
-        k_v = 2.3
-        k_a = 2.5
+        k_tau_u = 0.5  # Gain for forward thrust control
+        k_tau_r = 1.5  # Gain for yaw moment control
 
-        dist = jnp.linalg.norm(pos_diff, axis=-1)
-        theta_t = jnp.arctan2(-pos_diff[:, 1], -pos_diff[:, 0]) % (2 * jnp.pi)
-        theta = agent_states[:, 2] % (2 * jnp.pi)
+        # Extract state variables
+        phi = agent_states[:, 2]  # Heading angle
+        u = agent_states[:, 3]    # Forward velocity
+        v = agent_states[:, 4]    # Lateral velocity
+        r = agent_states[:, 5]    # Yaw rate
+
+        # Compute desired heading angle
+        theta_t = jnp.arctan2(pos_diff[:, 1], pos_diff[:, 0]) % (2 * jnp.pi)
+        theta = phi % (2 * jnp.pi)
         theta_diff = theta_t - theta
-        omega = jnp.zeros(agent_states.shape[0])
-        agent_dir = jnp.concatenate([jnp.cos(theta)[:, None], jnp.sin(theta)[:, None]], axis=-1)
-        assert agent_dir.shape == (agent_states.shape[0], 2)
-        theta_between = jnp.arccos(
-            jnp.clip(jnp.matmul(-pos_diff[:, None, :], agent_dir[:, :, None]).squeeze() / (dist + 0.0001),
-                     a_min=-1, a_max=1))
 
-        # when theta <= pi
-        # anti-clockwise
-        omega = jnp.where(jnp.logical_and(jnp.logical_and(theta_diff < jnp.pi, theta_diff >= 0), theta <= jnp.pi),
-                          k_omega * theta_between, omega)
-        # clockwise
-        omega = jnp.where(jnp.logical_and(
-            jnp.logical_not(jnp.logical_and(theta_diff < jnp.pi, theta_diff >= 0)), theta <= jnp.pi),
-            -k_omega * theta_between, omega
-        )
+        # Normalize theta_diff to the range [-pi, pi]
+        theta_diff = (theta_diff + jnp.pi) % (2 * jnp.pi) - jnp.pi
 
-        # when theta > pi
-        # clockwise
-        omega = jnp.where(jnp.logical_and(jnp.logical_and(theta_diff > -jnp.pi, theta_diff <= 0), theta > jnp.pi),
-                          -k_omega * theta_between, omega)
-        # anti-clockwise
-        omega = jnp.where(jnp.logical_and(
-            jnp.logical_not(jnp.logical_and(theta_diff > -jnp.pi, theta_diff <= 0)), theta > jnp.pi),
-            k_omega * theta_between, omega
-        )
+        # Compute forward thrust (tau_u)
+        dist = jnp.linalg.norm(pos_diff, axis=-1)
+        tau_u = k_tau_u * (dist - u)  # Proportional control for forward motion
 
-        omega = jnp.clip(omega, a_min=-5., a_max=5.)
+        # Compute yaw moment (tau_r) based on theta_diff
+        tau_r = jnp.zeros(agent_states.shape[0])
+        tau_r = jnp.where(theta_diff >= 0, k_tau_r * theta_diff, tau_r)  # Anti-clockwise
+        tau_r = jnp.where(theta_diff < 0, k_tau_r * theta_diff, tau_r)   # Clockwise
 
-        pos_diff_norm = jnp.sqrt(1e-6 + jnp.sum(pos_diff ** 2, axis=-1, keepdims=True))
-        comm_radius = self._params["comm_radius"]
-        safe_feats_norm = jnp.maximum(pos_diff_norm, comm_radius)
-        coef = jnp.where(pos_diff_norm > comm_radius, comm_radius / safe_feats_norm, 1.0)
-        pos_diff = coef * pos_diff
-        a = -k_a * agent_states[:, 3] + k_v * jnp.linalg.norm(pos_diff, axis=-1)
+        # Clip tau_u and tau_r based on action limits
+        lower_lim, upper_lim = self.action_lim()
+        tau_u = jnp.clip(tau_u, a_min=lower_lim[0], a_max=upper_lim[0])
+        tau_r = jnp.clip(tau_r, a_min=lower_lim[1], a_max=upper_lim[1])
 
-        action = jnp.concatenate([omega[:, None], a[:, None]], axis=-1)
+        # Combine actions into a single array
+        action = jnp.stack([tau_u, tau_r], axis=-1)
         return action
 
     def forward_graph(self, graph: GraphsTuple, action: Action) -> GraphsTuple:
@@ -563,7 +539,6 @@ class USV(MultiAgentEnv):
         next_states = jnp.concatenate([next_agent_states, goal_states, obs_states], axis=0)
 
         next_graph = self.add_edge_feats(graph, next_states)
-        ipdb.set_trace()
         return next_graph
 
     def safe_mask(self, graph: GraphsTuple) -> Array:
@@ -619,7 +594,6 @@ class USV(MultiAgentEnv):
                                          jnp.sqrt(agent_dist ** 2 - 4 * self._params['car_radius'] ** 2))
         unsafe_theta_obs = jnp.arctan2(self._params['car_radius'],
                                        jnp.sqrt(obs_dist ** 2 - self._params['car_radius'] ** 2))
-        unsafe_theta = jnp.concatenate([unsafe_theta_agent, unsafe_theta_obs], axis=1)
         lidar_mask = jnp.ones((self._params["n_rays"],))
         lidar_mask = jax.scipy.linalg.block_diag(*[lidar_mask] * self.num_agents)
         valid_mask = jnp.concatenate([jnp.ones((self.num_agents, self.num_agents)), lidar_mask], axis=-1)
