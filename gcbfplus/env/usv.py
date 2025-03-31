@@ -479,49 +479,71 @@ class USV(MultiAgentEnv):
         lower_limit, upper_limit: Tuple[Action, Action],
             limits of the action
         """
-        lower_lim = jnp.ones(2) * -3.0
-        upper_lim = jnp.ones(2) * 3.0
+        lower_lim = jnp.array([-50, -30])
+        upper_lim = jnp.array([300, 30])
         return lower_lim, upper_lim
+
 
     def u_ref(self, graph: GraphsTuple) -> Action:
         agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
         goal_states = graph.type_states(type_idx=1, n_type=self.num_agents)
-        pos_diff = goal_states[:, :2] - agent_states[:, :2]  # Corrected to point towards the goal
+        pos_diff = agent_states[:, :2] - goal_states[:, :2]
 
         # PID parameters
-        k_tau_u = 0.5  # Gain for forward thrust control
-        k_tau_r = 1.5  # Gain for yaw moment control
+        k_omega = 1.5  # 0.5
+        k_v = 2.3
+        k_a = 1
 
-        # Extract state variables
-        phi = agent_states[:, 2]  # Heading angle
-        u = agent_states[:, 3]    # Forward velocity
-        v = agent_states[:, 4]    # Lateral velocity
-        r = agent_states[:, 5]    # Yaw rate
-
-        # Compute desired heading angle
-        theta_t = jnp.arctan2(pos_diff[:, 1], pos_diff[:, 0]) % (2 * jnp.pi)
-        theta = phi % (2 * jnp.pi)
-        theta_diff = theta_t - theta
-
-        # Normalize theta_diff to the range [-pi, pi]
-        theta_diff = (theta_diff + jnp.pi) % (2 * jnp.pi) - jnp.pi
-
-        # Compute forward thrust (tau_u)
         dist = jnp.linalg.norm(pos_diff, axis=-1)
-        tau_u = k_tau_u * (dist - u)  # Proportional control for forward motion
+        theta_t = jnp.arctan2(-pos_diff[:, 1], -pos_diff[:, 0]) % (2 * jnp.pi)
+        theta = agent_states[:, 2] % (2 * jnp.pi)
+        theta_diff = theta_t - theta
+        omega = jnp.zeros(agent_states.shape[0])
+        agent_dir = jnp.concatenate([jnp.cos(theta)[:, None], jnp.sin(theta)[:, None]], axis=-1)
+        assert agent_dir.shape == (agent_states.shape[0], 2)
+        theta_between = jnp.arccos(
+            jnp.clip(jnp.matmul(-pos_diff[:, None, :], agent_dir[:, :, None]).squeeze() / (dist + 0.0001),
+                     a_min=-1, a_max=1))
 
-        # Compute yaw moment (tau_r) based on theta_diff
-        tau_r = jnp.zeros(agent_states.shape[0])
-        tau_r = jnp.where(theta_diff >= 0, k_tau_r * theta_diff, tau_r)  # Anti-clockwise
-        tau_r = jnp.where(theta_diff < 0, k_tau_r * theta_diff, tau_r)   # Clockwise
+        # when theta <= pi
+        # anti-clockwise
+        omega = jnp.where(jnp.logical_and(jnp.logical_and(theta_diff < jnp.pi, theta_diff >= 0), theta <= jnp.pi),
+                          k_omega * theta_between, omega)
+        # clockwise
+        omega = jnp.where(jnp.logical_and(
+            jnp.logical_not(jnp.logical_and(theta_diff < jnp.pi, theta_diff >= 0)), theta <= jnp.pi),
+            -k_omega * theta_between, omega
+        )
 
-        # Clip tau_u and tau_r based on action limits
-        lower_lim, upper_lim = self.action_lim()
-        tau_u = jnp.clip(tau_u, a_min=lower_lim[0], a_max=upper_lim[0])
-        tau_r = jnp.clip(tau_r, a_min=lower_lim[1], a_max=upper_lim[1])
+        # when theta > pi
+        # clockwise
+        omega = jnp.where(jnp.logical_and(jnp.logical_and(theta_diff > -jnp.pi, theta_diff <= 0), theta > jnp.pi),
+                          -k_omega * theta_between, omega)
+        # anti-clockwise
+        omega = jnp.where(jnp.logical_and(
+            jnp.logical_not(jnp.logical_and(theta_diff > -jnp.pi, theta_diff <= 0)), theta > jnp.pi),
+            k_omega * theta_between, omega
+        )
 
-        # Combine actions into a single array
-        action = jnp.stack([tau_u, tau_r], axis=-1)
+        omega = jnp.clip(omega,a_min=-30., a_max=30.)
+
+        u = agent_states[:, 3]    
+        v = agent_states[:, 4]    
+        velocity_contribution = jnp.stack([
+            u * jnp.cos(agent_states[:, 2]) - v * jnp.sin(agent_states[:, 2]),  # x-direction contribution
+            u * jnp.sin(agent_states[:, 2]) + v * jnp.cos(agent_states[:, 2])   # y-direction contribution
+        ], axis=-1)
+        v_norm = jnp.linalg.norm(velocity_contribution, axis=-1)
+
+        pos_diff_norm = jnp.sqrt(1e-6 + jnp.sum(pos_diff ** 2, axis=-1, keepdims=True))
+        comm_radius = self._params["comm_radius"]
+        safe_feats_norm = jnp.maximum(pos_diff_norm, comm_radius)
+        coef = jnp.where(pos_diff_norm > comm_radius, comm_radius / safe_feats_norm, 1.0)
+        pos_diff = coef * pos_diff
+        a = -k_a * v_norm + k_v * jnp.linalg.norm(pos_diff, axis=-1)
+
+        a = jnp.clip(a, a_min=-50., a_max=300.)
+        action = jnp.concatenate([a[:, None], omega[:, None]], axis=-1)
         return action
 
     def forward_graph(self, graph: GraphsTuple, action: Action) -> GraphsTuple:
